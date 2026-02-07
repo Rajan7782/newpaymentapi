@@ -1,137 +1,157 @@
 import imaplib
 import email
-import os
+from email.header import decode_header
 import re
-import sys
+import os
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from html import unescape
 
-# ---------------- BASIC SETUP ----------------
+# ---------- ENV LOAD ----------
 load_dotenv()
-sys.stdout.reconfigure(encoding="utf-8")
 
 EMAIL_HOST = os.getenv("EMAIL_HOST", "imap.gmail.com")
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 API_SECRET = os.getenv("API_SECRET")
 
+ALLOWED_FROM = ["no-reply@paytm.com"]
+
+SEARCH_KEYWORDS = [
+    "payment received",
+    "paytm for business",
+    "paid",
+    "credited",
+    "rs."
+]
+
 app = Flask(__name__)
 
-# ---------------- HELPERS ----------------
-def clean_html(raw_html: str) -> str:
-    if not raw_html:
+# ---------- HELPERS ----------
+
+def clean_text(text: str) -> str:
+    if not text:
         return ""
 
-    # fix Paytm non-breaking space issue
-    raw_html = raw_html.replace("\xa0", " ")
-
-    # remove HTML tags
-    text = re.sub(r"<[^>]+>", " ", raw_html)
+    # remove non-breaking space
+    text = text.replace("\xa0", " ")
 
     # decode html entities
     text = unescape(text)
 
+    # remove html tags
+    text = re.sub(r"<[^>]+>", " ", text)
+
     # normalize spaces
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def extract_amount(text: str):
-    """
-    Matches:
-    ₹2 | ₹ 2 | ₹2.00 | Rs.2 | Rs 2.00
-    """
-    if not text:
-        return None
-
-    match = re.search(
+def parse_amount(text: str):
+    m = re.search(
         r"(₹|rs\.?)\s*([0-9]+(?:\.[0-9]{1,2})?)",
         text,
-        re.IGNORECASE
+        re.IGNORECASE,
     )
-    if match:
-        return float(match.group(2))
+    if m:
+        return float(m.group(2))
     return None
 
 
-def check_paytm_transaction():
-    try:
-        mail = imaplib.IMAP4_SSL(EMAIL_HOST)
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
+def connect_imap():
+    mail = imaplib.IMAP4_SSL(EMAIL_HOST)
+    mail.login(EMAIL_USER, EMAIL_PASS)
+    mail.select("INBOX")
+    return mail
 
-        # ONLY official Paytm mails
-        status, messages = mail.search(
-            None,
-            '(FROM "no-reply@paytm.com")'
-        )
-        if status != "OK":
-            mail.logout()
-            return False, None
 
-        mail_ids = messages[0].split()[-40:]  # last 40 mails
+def fetch_latest_paytm_payment():
+    mail = connect_imap()
 
-        for num in reversed(mail_ids):
-            _, msg_data = mail.fetch(num, "(RFC822)")
-            for response in msg_data:
-                if not isinstance(response, tuple):
-                    continue
+    status, messages = mail.search(None, '(FROM "no-reply@paytm.com")')
+    if status != "OK":
+        mail.logout()
+        return None
 
-                msg = email.message_from_bytes(response[1])
-                subject = msg.get("Subject", "")
+    ids = messages[0].split()[-30:]  # last 30 emails
 
-                full_text = ""
+    for msg_id in reversed(ids):
+        _, msg_data = mail.fetch(msg_id, "(RFC822)")
+        msg = email.message_from_bytes(msg_data[0][1])
 
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() in ("text/html", "text/plain"):
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                full_text += payload.decode("utf-8", errors="ignore")
-                else:
-                    payload = msg.get_payload(decode=True)
+        from_header = (msg.get("From") or "").lower()
+        if not any(a in from_header for a in ALLOWED_FROM):
+            continue
+
+        # subject
+        subject_raw, enc = decode_header(msg.get("Subject"))[0]
+        if isinstance(subject_raw, bytes):
+            subject = subject_raw.decode(enc or "utf-8", errors="ignore")
+        else:
+            subject = subject_raw or ""
+
+        # body
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() in ("text/plain", "text/html"):
+                    payload = part.get_payload(decode=True)
                     if payload:
-                        full_text = payload.decode("utf-8", errors="ignore")
+                        body += payload.decode("utf-8", errors="ignore")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body = payload.decode("utf-8", errors="ignore")
 
-                cleaned = clean_html(full_text + " " + subject)
-                amount = extract_amount(cleaned)
+        combined = clean_text(subject + " " + body).lower()
 
-                if amount is not None:
-                    mail.logout()
-                    return True, amount
+        if not any(k in combined for k in SEARCH_KEYWORDS):
+            continue
+
+        amount = parse_amount(combined)
+        if amount is None:
+            continue
 
         mail.logout()
-        return False, None
+        return {
+            "amount": amount,
+            "subject": subject,
+            "from": msg.get("From"),
+            "time": msg.get("Date"),
+        }
 
-    except Exception as e:
-        print("ERROR:", str(e).encode("utf-8", errors="ignore"))
-        return False, None
+    mail.logout()
+    return None
 
 
-# ---------------- ROUTES ----------------
-@app.route("/verify-paytm", methods=["POST"])
+# ---------- ROUTES ----------
+
+@app.post("/verify-paytm")
 def verify_paytm():
     if request.headers.get("x-api-key") != API_SECRET:
-        return jsonify({
-            "success": False,
-            "message": "Unauthorized"
-        }), 401
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
 
-    verified, amount = check_paytm_transaction()
+    payment = fetch_latest_paytm_payment()
+
+    if not payment:
+        return jsonify({
+            "success": True,
+            "verified": False,
+            "amount": None
+        })
 
     return jsonify({
         "success": True,
-        "verified": verified,
-        "amount": amount
+        "verified": True,
+        "amount": payment["amount"],
+        "details": payment
     })
 
 
-@app.route("/", methods=["GET"])
+@app.get("/")
 def home():
     return "Paytm Verify API Running"
 
 
-# ---------------- RUN ----------------
 if __name__ == "__main__":
-    app.run()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
