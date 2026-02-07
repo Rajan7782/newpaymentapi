@@ -1,6 +1,7 @@
 import imaplib
 import email
 import os
+import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -13,21 +14,27 @@ API_SECRET = os.getenv("API_SECRET")
 
 app = Flask(__name__)
 
+def extract_amount(text):
+    """
+    Extracts amount like: Rs. 2.00 or ₹2.00
+    """
+    match = re.search(r"(Rs\.?|₹)\s?([0-9]+(?:\.[0-9]{1,2})?)", text)
+    if match:
+        return float(match.group(2))
+    return None
+
+
 def check_paytm_transaction(txn_id):
     try:
         mail = imaplib.IMAP4_SSL(EMAIL_HOST)
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select("inbox")
 
-        status, messages = mail.search(
-            None,
-            '(FROM "paytm.com")'
-        )
-
+        status, messages = mail.search(None, '(FROM "paytm.com")')
         if status != "OK":
-            return False
+            return False, None
 
-        mail_ids = messages[0].split()[-15:]  # last 15 emails only
+        mail_ids = messages[0].split()[-20:]  # last 20 mails
 
         for num in mail_ids:
             _, msg_data = mail.fetch(num, "(RFC822)")
@@ -43,16 +50,18 @@ def check_paytm_transaction(txn_id):
                     else:
                         body = msg.get_payload(decode=True).decode(errors="ignore")
 
+                    # 🔍 TXN ID match
                     if txn_id in body:
+                        amount = extract_amount(body)
                         mail.logout()
-                        return True
+                        return True, amount
 
         mail.logout()
-        return False
+        return False, None
 
     except Exception as e:
         print("ERROR:", e)
-        return False
+        return False, None
 
 
 @app.route("/verify-paytm", methods=["POST"])
@@ -70,11 +79,12 @@ def verify_paytm():
             "message": "Transaction ID required"
         }), 400
 
-    verified = check_paytm_transaction(txn_id)
+    verified, amount = check_paytm_transaction(txn_id)
 
     return jsonify({
         "success": True,
-        "verified": verified
+        "verified": verified,
+        "amount": amount
     })
 
 
