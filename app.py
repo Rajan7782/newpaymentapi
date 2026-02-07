@@ -28,6 +28,16 @@ ALLOWED_FROM = [
 
 app = Flask(__name__)
 
+# ---------- TEXT CLEANER (🔥 MAIN FIX) ----------
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    # non-breaking space fix
+    text = text.replace("\xa0", " ")
+    # normalize spaces
+    return re.sub(r"\s+", " ", text).strip()
+
 # ---------- HELPERS ----------
 
 def parse_amount(text: str):
@@ -44,22 +54,16 @@ def parse_amount(text: str):
 
 
 def parse_sender(body: str):
-    m = re.search(r"\b([a-z0-9._-]+@[a-z]{2,15})\b", body, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r"bhim\s+upi\s+([a-z0-9._-]+@[a-z]{2,15})", body, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r"vpa[:\s]+([a-z0-9._-]+@[a-z]{2,15})", body, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r"from[:\s]+([a-z0-9._-]+@[a-z]{2,15})", body, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
+    patterns = [
+        r"\b([a-z0-9._-]+@[a-z]{2,15})\b",
+        r"bhim\s+upi\s+([a-z0-9._-]+@[a-z]{2,15})",
+        r"vpa[:\s]+([a-z0-9._-]+@[a-z]{2,15})",
+        r"from[:\s]+([a-z0-9._-]+@[a-z]{2,15})",
+    ]
+    for p in patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
     return None
 
 
@@ -72,7 +76,8 @@ def parse_order_id(text: str):
 
 def connect_imap():
     if not EMAIL_USER or not EMAIL_PASS:
-        raise RuntimeError("EMAIL_USER / EMAIL_PASS env vars set nahi hain.")
+        raise RuntimeError("EMAIL_USER / EMAIL_PASS env vars missing")
+
     mail = imaplib.IMAP4_SSL(EMAIL_HOST)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("INBOX")
@@ -85,7 +90,7 @@ def fetch_transaction(tx_id: str):
     status, messages = mail.search(None, f'TEXT "{tx_id}"')
     if status != "OK":
         mail.logout()
-        raise Exception("IMAP search error")
+        raise Exception("IMAP search failed")
 
     ids = messages[0].split()
 
@@ -116,7 +121,7 @@ def fetch_transaction(tx_id: str):
             if payload:
                 body += payload.decode("utf-8", errors="ignore")
 
-        combined = (subject + "\n" + body).lower()
+        combined = clean_text(subject + "\n" + body).lower()
 
         if not any(k in combined for k in SEARCH_KEYWORDS):
             continue
@@ -147,30 +152,23 @@ def fetch_transaction(tx_id: str):
 # ---------- TX ID GETTER (GET + POST) ----------
 
 def get_tx_id():
-    # GET query
-    for key in [
+    keys = [
         "tx_id",
         "txn_id",
         "trx",
         "id",
         "transaction_id",
         "transection_id",
-    ]:
+    ]
+
+    for key in keys:
         val = request.args.get(key)
         if val and val.strip():
             return val.strip()
 
-    # POST body
     if request.is_json:
         data = request.get_json(silent=True) or {}
-        for key in [
-            "tx_id",
-            "txn_id",
-            "trx",
-            "id",
-            "transaction_id",
-            "transection_id",
-        ]:
+        for key in keys:
             val = data.get(key)
             if val and str(val).strip():
                 return str(val).strip()
@@ -182,10 +180,6 @@ def get_tx_id():
 
 @app.route("/trx", methods=["GET", "POST"])
 def trx_api():
-    """
-    GET  /trx?tx_id=ORDER_ID
-    POST /trx  { "tx_id": "ORDER_ID" }
-    """
     tx_id = get_tx_id()
 
     if not tx_id:
@@ -197,7 +191,9 @@ def trx_api():
     try:
         result = fetch_transaction(tx_id)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        # 🔥 encoding-safe error
+        err = str(e).encode("utf-8", errors="ignore").decode("utf-8")
+        return jsonify({"ok": False, "error": err}), 500
 
     if not result:
         return jsonify({
@@ -220,4 +216,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port)
