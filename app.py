@@ -16,14 +16,7 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 API_SECRET = os.getenv("API_SECRET")
 
 ALLOWED_FROM = ["no-reply@paytm.com"]
-
-SEARCH_KEYWORDS = [
-    "payment received",
-    "paytm for business",
-    "paid",
-    "credited",
-    "rs."
-]
+SEARCH_KEYWORDS = ["payment received", "paytm for business", "paid", "credited", "rs."]
 
 app = Flask(__name__)
 
@@ -32,17 +25,9 @@ app = Flask(__name__)
 def clean_text(text: str) -> str:
     if not text:
         return ""
-
-    # remove non-breaking space
     text = text.replace("\xa0", " ")
-
-    # decode html entities
     text = unescape(text)
-
-    # remove html tags
     text = re.sub(r"<[^>]+>", " ", text)
-
-    # normalize spaces
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -72,7 +57,7 @@ def fetch_latest_paytm_payment():
         mail.logout()
         return None
 
-    ids = messages[0].split()[-30:]  # last 30 emails
+    ids = messages[0].split()[-30:]
 
     for msg_id in reversed(ids):
         _, msg_data = mail.fetch(msg_id, "(RFC822)")
@@ -123,12 +108,37 @@ def fetch_latest_paytm_payment():
     return None
 
 
+def get_trx_id():
+    """
+    trx id GET ya POST dono se nikaal lega
+    """
+    # 1️⃣ GET query
+    for key in ["trx", "tx_id", "txn_id", "transaction_id"]:
+        val = request.args.get(key)
+        if val:
+            return val.strip()
+
+    # 2️⃣ POST body
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        for key in ["trx", "tx_id", "txn_id", "transaction_id"]:
+            val = data.get(key)
+            if val:
+                return str(val).strip()
+
+    return None
+
+
 # ---------- ROUTES ----------
 
-@app.post("/verify-paytm")
+@app.route("/verify-paytm", methods=["GET", "POST"])
 def verify_paytm():
-    if request.headers.get("x-api-key") != API_SECRET:
-        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    # 🔐 secret only required for POST
+    if request.method == "POST":
+        if request.headers.get("x-api-key") != API_SECRET:
+            return jsonify({"success": False, "message": "Unauthorized"}), 401
+
+    trx_id = get_trx_id()  # optional (future use)
 
     payment = fetch_latest_paytm_payment()
 
@@ -136,13 +146,15 @@ def verify_paytm():
         return jsonify({
             "success": True,
             "verified": False,
-            "amount": None
+            "amount": None,
+            "trx": trx_id
         })
 
     return jsonify({
         "success": True,
         "verified": True,
         "amount": payment["amount"],
+        "trx": trx_id,
         "details": payment
     })
 
