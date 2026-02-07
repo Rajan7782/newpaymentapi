@@ -15,10 +15,8 @@ API_SECRET = os.getenv("API_SECRET")
 app = Flask(__name__)
 
 def extract_amount(text):
-    """
-    Extracts amount like: Rs. 2.00 or ₹2.00
-    """
-    match = re.search(r"(Rs\.?|₹)\s?([0-9]+(?:\.[0-9]{1,2})?)", text)
+    # Rs. 2.00 | Rs 2 | ₹2.00
+    match = re.search(r"(Rs\.?|₹)\s*([0-9]+(?:\.[0-9]{1,2})?)", text, re.IGNORECASE)
     if match:
         return float(match.group(2))
     return None
@@ -30,31 +28,44 @@ def check_paytm_transaction(txn_id):
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select("inbox")
 
-        status, messages = mail.search(None, '(FROM "paytm.com")')
+        # 🔥 SUBJECT based search (IMPORTANT)
+        status, messages = mail.search(
+            None,
+            '(SUBJECT "paid" SUBJECT "Payment" SUBJECT "received")'
+        )
+
         if status != "OK":
             return False, None
 
-        mail_ids = messages[0].split()[-20:]  # last 20 mails
+        mail_ids = messages[0].split()[-30:]  # last 30 mails
 
         for num in mail_ids:
             _, msg_data = mail.fetch(num, "(RFC822)")
             for response in msg_data:
-                if isinstance(response, tuple):
-                    msg = email.message_from_bytes(response[1])
+                if not isinstance(response, tuple):
+                    continue
 
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            if part.get_content_type() == "text/plain":
-                                body += part.get_payload(decode=True).decode(errors="ignore")
-                    else:
-                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                msg = email.message_from_bytes(response[1])
 
-                    # 🔍 TXN ID match
-                    if txn_id in body:
-                        amount = extract_amount(body)
-                        mail.logout()
-                        return True, amount
+                full_text = ""
+
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        content_type = part.get_content_type()
+                        if content_type in ["text/plain", "text/html"]:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                full_text += payload.decode(errors="ignore")
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        full_text = payload.decode(errors="ignore")
+
+                # 🔍 TXN ID match
+                if txn_id in full_text:
+                    amount = extract_amount(full_text)
+                    mail.logout()
+                    return True, amount
 
         mail.logout()
         return False, None
@@ -66,18 +77,14 @@ def check_paytm_transaction(txn_id):
 
 @app.route("/verify-paytm", methods=["POST"])
 def verify_paytm():
-    secret = request.headers.get("x-api-key")
-    if secret != API_SECRET:
+    if request.headers.get("x-api-key") != API_SECRET:
         return jsonify({"success": False, "message": "Unauthorized"}), 401
 
     data = request.get_json()
     txn_id = data.get("txn_id")
 
     if not txn_id:
-        return jsonify({
-            "success": False,
-            "message": "Transaction ID required"
-        }), 400
+        return jsonify({"success": False, "message": "Transaction ID required"}), 400
 
     verified, amount = check_paytm_transaction(txn_id)
 
