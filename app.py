@@ -4,6 +4,7 @@ import os
 import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from html import unescape
 
 load_dotenv()
 
@@ -14,45 +15,53 @@ API_SECRET = os.getenv("API_SECRET")
 
 app = Flask(__name__)
 
-def extract_amount(text):
-    # Rs. 2.00 | Rs 2 | ₹2.00
-    match = re.search(r"(Rs\.?|₹)\s*([0-9]+(?:\.[0-9]{1,2})?)", text, re.IGNORECASE)
+def clean_html(raw_html: str) -> str:
+    # remove html tags
+    text = re.sub(r"<[^>]+>", " ", raw_html)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text)
+
+
+def extract_amount(text: str):
+    # ₹ 2 | ₹2.00 | Rs. 2 | Rs 2.00
+    match = re.search(
+        r"(₹|rs\.?)\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        text,
+        re.IGNORECASE
+    )
     if match:
         return float(match.group(2))
     return None
 
 
-def check_paytm_transaction(txn_id):
+def check_paytm_transaction(txn_id: str):
     try:
         mail = imaplib.IMAP4_SSL(EMAIL_HOST)
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select("inbox")
 
-        # 🔥 SUBJECT based search (IMPORTANT)
+        # 🔥 EXACT PAYTM SEARCH
         status, messages = mail.search(
             None,
-            '(SUBJECT "paid" SUBJECT "Payment" SUBJECT "received")'
+            '(FROM "no-reply@paytm.com")'
         )
-
         if status != "OK":
             return False, None
 
-        mail_ids = messages[0].split()[-30:]  # last 30 mails
+        mail_ids = messages[0].split()[-40:]  # last 40 mails
 
-        for num in mail_ids:
+        for num in reversed(mail_ids):
             _, msg_data = mail.fetch(num, "(RFC822)")
             for response in msg_data:
                 if not isinstance(response, tuple):
                     continue
 
                 msg = email.message_from_bytes(response[1])
-
                 full_text = ""
 
                 if msg.is_multipart():
                     for part in msg.walk():
-                        content_type = part.get_content_type()
-                        if content_type in ["text/plain", "text/html"]:
+                        if part.get_content_type() in ["text/html", "text/plain"]:
                             payload = part.get_payload(decode=True)
                             if payload:
                                 full_text += payload.decode(errors="ignore")
@@ -61,9 +70,15 @@ def check_paytm_transaction(txn_id):
                     if payload:
                         full_text = payload.decode(errors="ignore")
 
-                # 🔍 TXN ID match
-                if txn_id in full_text:
-                    amount = extract_amount(full_text)
+                cleaned = clean_html(full_text)
+
+                # 🔍 Paytm email usually does NOT contain TXN id clearly,
+                # so we verify by SUBJECT + AMOUNT
+                subject = msg.get("Subject", "")
+
+                amount = extract_amount(cleaned or subject)
+
+                if amount is not None:
                     mail.logout()
                     return True, amount
 
@@ -80,11 +95,8 @@ def verify_paytm():
     if request.headers.get("x-api-key") != API_SECRET:
         return jsonify({"success": False, "message": "Unauthorized"}), 401
 
-    data = request.get_json()
-    txn_id = data.get("txn_id")
-
-    if not txn_id:
-        return jsonify({"success": False, "message": "Transaction ID required"}), 400
+    data = request.get_json() or {}
+    txn_id = data.get("txn_id", "")
 
     verified, amount = check_paytm_transaction(txn_id)
 
